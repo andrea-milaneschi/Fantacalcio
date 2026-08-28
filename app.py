@@ -128,20 +128,38 @@ if st.session_state.storico:
 st.sidebar.button("🔄 Reset asta", on_click=reset_asta)
 
 
+PARTITE_STAGIONE = 38  # lunghezza campionato Serie A, per stimare la % di presenze
+
+
+def valuta_titolarita(partite):
+    if pd.isna(partite):
+        return {"cat": "ignoto", "icon": "⚪", "label": "Dato non disponibile (nuovo acquisto/debuttante)", "affidabilita": None}
+    if partite >= 25:
+        return {"cat": "titolare", "icon": "🟢", "label": "Titolare fisso", "affidabilita": 1.0}
+    if partite >= 15:
+        return {"cat": "rotazione", "icon": "🟡", "label": "Titolare / rotazione", "affidabilita": 0.85}
+    if partite >= 5:
+        return {"cat": "panchina", "icon": "🟠", "label": "Panchina, poco impiegato", "affidabilita": 0.55}
+    return {"cat": "marginale", "icon": "🔴", "label": "Quasi mai in campo", "affidabilita": 0.3}
+
+
 # ---------------- motore di raccomandazione ----------------
 def calcola_consiglio(player):
     ruolo = player["ruolo"]
     quotazione = max(1.0, player["quotazione"])
+    titolarita = valuta_titolarita(player["partite"])
 
     # 1) prezzo di mercato atteso: curva calibrata sui prezzi reali della tua lega
     fattore_budget_utente = budget_totale / BUDGET_RIFERIMENTO_CURVA
     prezzo_mercato = (quotazione ** gamma_ruolo[ruolo]) * fattore_budget_utente
 
-    # 2) aggiustamento leggero in base al rendimento reale rispetto alla media del ruolo
+    # 2) aggiustamento leggero in base al rendimento reale rispetto alla media del ruolo, smorzato
+    # se il giocatore ha giocato poco (una fantamedia alta su 5 partite è rumore, non segnale)
     media_fm = media_fantamedia_ruolo.get(ruolo, float("nan"))
     if pd.notna(player["fantamedia"]) and pd.notna(media_fm) and media_fm > 0:
         scarto = (player["fantamedia"] - media_fm) / media_fm
-        fattore_fm = min(1.25, max(0.8, 1 + scarto * 0.6))
+        affidabilita = titolarita["affidabilita"] if titolarita["affidabilita"] is not None else 1.0
+        fattore_fm = min(1.25, max(0.8, 1 + scarto * affidabilita * 0.6))
     else:
         fattore_fm = 1.0
     prezzo_atteso = prezzo_mercato * fattore_fm
@@ -172,6 +190,16 @@ def calcola_consiglio(player):
             f"per completare gli altri {altri_slot_da_riempire} slot liberi (mancherebbero **{-round(margine_dopo_acquisto)} crediti**). "
             "Fattibile solo se sai già che gli altri slot ti costeranno pochissimo."
         )
+    elif titolarita["cat"] in ("panchina", "marginale") and prezzo_suggerito > 5:
+        esito = "DUBBIO — RISCHIO PANCHINA"
+        colore = "warning"
+        presenze = int(player["partite"])
+        dettaglio = (
+            f"{titolarita['icon']} {titolarita['label']} nella scorsa stagione (**{presenze}/{PARTITE_STAGIONE} presenze**). "
+            f"Il prezzo di mercato atteso è ~{prezzo_suggerito} crediti, ma se gioca poco anche quest'anno non li ripaga. "
+            "Prendilo solo se hai un motivo concreto per pensare che avrà più spazio (titolare designato, rivale infortunato, nuovo allenatore) — "
+            "altrimenti abbassa parecchio l'offerta o lascialo perdere."
+        )
     else:
         esito = "PRENDILO"
         colore = "success"
@@ -179,13 +207,20 @@ def calcola_consiglio(player):
             f"Prezzo di mercato atteso **~{prezzo_suggerito} crediti**. Te lo puoi permettere: "
             f"dopo l'acquisto ti resterebbero comunque {round(margine_dopo_acquisto)} crediti di margine oltre al minimo per chiudere la rosa."
         )
+        if titolarita["cat"] == "ignoto":
+            dettaglio += " ℹ️ Nessuna statistica 2025/26 (nuovo acquisto/debuttante): non posso verificare la titolarità, informati sul suo ruolo nella nuova squadra."
+        elif titolarita["cat"] in ("panchina", "marginale"):
+            dettaglio += f" {titolarita['icon']} {titolarita['label']} ({int(player['partite'])} pres.): va bene come scommessa economica di fondo rosa, non aspettarti continuità."
 
-    occasione = pd.notna(player["fantamedia"]) and fattore_fm >= 1.15 and prezzo_mercato <= budget_totale * 0.05
+    occasione = (
+        pd.notna(player["fantamedia"]) and fattore_fm >= 1.15 and prezzo_mercato <= budget_totale * 0.05
+        and titolarita["cat"] in ("titolare", "rotazione")
+    )
 
     return {
         "esito": esito, "colore": colore, "dettaglio": dettaglio,
         "prezzo_mercato": round(prezzo_mercato), "prezzo_suggerito": prezzo_suggerito,
-        "occasione": occasione,
+        "occasione": occasione, "titolarita": titolarita,
     }
 
 
@@ -210,7 +245,10 @@ if nome_cercato:
     c1, c2 = st.columns([2, 1])
 
     with c1:
+        tit = consiglio["titolarita"]
+        presenze_str = f"{int(player['partite'])}/{PARTITE_STAGIONE} presenze 2025/26" if pd.notna(player["partite"]) else "nessun dato presenze"
         st.subheader(f"{player['nome']} — {player['squadra']} ({RUOLO_NOME[player['ruolo']]})")
+        st.markdown(f"{tit['icon']} **{tit['label']}** · {presenze_str}")
 
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Quotazione uff.", f"{player['quotazione']:.0f}")
@@ -219,7 +257,11 @@ if nome_cercato:
         m4.metric("Gol", f"{player['gol']:.0f}" if pd.notna(player["gol"]) else "n/d")
         m5.metric("Assist", f"{player['assist']:.0f}" if pd.notna(player["assist"]) else "n/d")
         m6.metric("FVM", f"{player['fvm']:.0f}" if pd.notna(player["fvm"]) else "n/d")
-        st.caption("Il **prezzo di mercato atteso** è quanto probabilmente costerà questo giocatore in un'asta da 1000 crediti come la tua, in base alla curva calibrata sui prezzi reali. Il consiglio sotto lo confronta con quanto TU puoi permetterti ora.")
+        st.caption(
+            "Il **prezzo di mercato atteso** è quanto probabilmente costerà questo giocatore in un'asta da 1000 "
+            "crediti come la tua, in base alla curva calibrata sui prezzi reali e smorzata dalla titolarità. "
+            "Il consiglio sotto lo confronta con quanto TU puoi permetterti ora — e con quanto rischia di stare in panchina."
+        )
 
         if pd.isna(player["fantamedia"]):
             st.caption("⚠️ Nessuna statistica trovata per la scorsa stagione (probabile nuovo acquisto, debuttante o dato non disponibile). Il consiglio si basa solo sulla quotazione ufficiale.")
