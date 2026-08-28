@@ -11,7 +11,6 @@ st.set_page_config(page_title="Asta Fantacalcio 2026/27", page_icon="⚽", layou
 RUOLI = ["P", "D", "C", "A"]
 RUOLO_NOME = {"P": "Portiere", "D": "Difensore", "C": "Centrocampista", "A": "Attaccante"}
 DEFAULT_SLOT = {"P": 3, "D": 8, "C": 8, "A": 6}
-DEFAULT_PESO = {"P": 0.06, "D": 0.18, "C": 0.32, "A": 0.44}
 
 # Curva di prezzo di mercato: prezzo_atteso = quotazione ^ gamma_ruolo, calibrata sui prezzi
 # reali osservati nella tua lega (Malen/L.Martinez=300, attaccanti forti 250-300, centro forti 100-150)
@@ -112,12 +111,6 @@ with st.sidebar.expander("🎯 Calibrazione prezzi di mercato"):
             min_value=1, value=PREZZO_TOP_DEFAULT[r], step=5, key=f"prezzo_top_{r}",
         )
 
-with st.sidebar.expander("⚙️ Impostazioni avanzate"):
-    st.caption("Quanto peso economico dare a ciascun ruolo nel calcolo di quanto puoi permetterti (solo per l'avviso di cautela/rischio).")
-    peso = {}
-    for r in RUOLI:
-        peso[r] = st.slider(f"Peso {RUOLO_NOME[r]}", 0.0, 1.0, DEFAULT_PESO[r], 0.01, key=f"peso_{r}")
-
 # gamma per ruolo: prezzo(quotazione) = quotazione ^ gamma, tarato in modo che prezzo(quot_max) = prezzo_top
 gamma_ruolo = {}
 for r in RUOLI:
@@ -152,20 +145,12 @@ def calcola_consiglio(player):
     else:
         fattore_fm = 1.0
     prezzo_atteso = prezzo_mercato * fattore_fm
+    prezzo_suggerito = int(round(max(1, prezzo_atteso)))
 
-    # 3) quanto puoi permetterti TU adesso, dato il ritmo di spesa rispetto agli slot ancora da riempire
-    frazione_soldi = crediti_residui / budget_totale if budget_totale > 0 else 0
-    frazione_slot = slot_liberi_totali / rosa_totale if rosa_totale > 0 else 1
-    ritmo = frazione_soldi / frazione_slot if frazione_slot > 0 else 1
-    fattore_ritmo = min(1.3, max(0.75, ritmo))
-
-    # quanto budget "ti spetterebbe" in media per uno slot di questo ruolo, dati gli slot liberi
-    peso_pesato = {r: slot_liberi[r] * peso[r] for r in RUOLI}
-    somma_pesi = sum(peso_pesato.values())
-    quota_ruolo = crediti_residui * peso_pesato[ruolo] / somma_pesi if somma_pesi > 0 else 0
-    budget_medio_slot_ruolo = quota_ruolo / slot_liberi[ruolo] if slot_liberi[ruolo] > 0 else 0
-
-    prezzo_suggerito = int(round(max(1, min(prezzo_atteso * fattore_ritmo, max(crediti_residui, 0)))))
+    # vincolo reale dell'asta: dopo aver preso questo giocatore devi comunque poter chiudere
+    # tutti gli altri slot liberi, e in un'asta random il minimo per ogni slot è 1 credito.
+    altri_slot_da_riempire = max(0, slot_liberi_totali - 1)
+    margine_dopo_acquisto = crediti_residui - prezzo_atteso - altri_slot_da_riempire
 
     if slot_liberi[ruolo] == 0:
         esito = "RUOLO COMPLETO"
@@ -179,27 +164,28 @@ def calcola_consiglio(player):
         esito = "FUORI PORTATA"
         colore = "error"
         dettaglio = f"Il prezzo di mercato atteso (~{round(prezzo_atteso)} cr.) supera i tuoi crediti residui ({crediti_residui}). Non rincorrerlo."
+    elif margine_dopo_acquisto < 0:
+        esito = "RISCHIO — PROSCIUGHI IL BUDGET"
+        colore = "warning"
+        dettaglio = (
+            f"Te lo puoi permettere, ma pagarlo ~{prezzo_suggerito} cr. ti lascerebbe sotto il minimo "
+            f"per completare gli altri {altri_slot_da_riempire} slot liberi (mancherebbero **{-round(margine_dopo_acquisto)} crediti**). "
+            "Fattibile solo se sai già che gli altri slot ti costeranno pochissimo."
+        )
     else:
-        rapporto = prezzo_atteso / budget_medio_slot_ruolo if budget_medio_slot_ruolo > 0 else 1
-        if rapporto <= 1.2:
-            esito = "PRENDILO"
-            colore = "success"
-            dettaglio = f"Prezzo sostenibile per il budget che hai sul ruolo. Preparati a offrire fino a **{prezzo_suggerito} crediti**."
-        elif rapporto <= 1.8:
-            esito = "VALUTA CON CAUTELA"
-            colore = "warning"
-            dettaglio = f"Costerà più della media che ti puoi permettere per il ruolo. Spingiti al massimo fino a **{prezzo_suggerito} crediti**, solo se lo vuoi davvero e sei disposto a tagliare altrove."
-        else:
-            esito = "EVITA / RISCHIO SBILANCIARE"
-            colore = "error"
-            dettaglio = f"Prezzo atteso troppo alto rispetto al budget rimasto per il ruolo ({round(budget_medio_slot_ruolo)} cr. medi/slot). Rischi di non chiudere la rosa."
+        esito = "PRENDILO"
+        colore = "success"
+        dettaglio = (
+            f"Prezzo di mercato atteso **~{prezzo_suggerito} crediti**. Te lo puoi permettere: "
+            f"dopo l'acquisto ti resterebbero comunque {round(margine_dopo_acquisto)} crediti di margine oltre al minimo per chiudere la rosa."
+        )
 
     occasione = pd.notna(player["fantamedia"]) and fattore_fm >= 1.15 and prezzo_mercato <= budget_totale * 0.05
 
     return {
         "esito": esito, "colore": colore, "dettaglio": dettaglio,
         "prezzo_mercato": round(prezzo_mercato), "prezzo_suggerito": prezzo_suggerito,
-        "budget_medio_slot_ruolo": round(budget_medio_slot_ruolo), "occasione": occasione,
+        "occasione": occasione,
     }
 
 
