@@ -18,6 +18,19 @@ DEFAULT_SLOT = {"P": 3, "D": 8, "C": 8, "A": 6}
 # prudente (curva simile, prezzo top più basso, coerente con come di solito vanno in asta) — tarabili qui sotto.
 BUDGET_RIFERIMENTO_CURVA = 1000
 PREZZO_TOP_DEFAULT = {"A": 300, "C": 150, "D": 130, "P": 70}
+PARTITE_STAGIONE = 38  # lunghezza campionato Serie A, per stimare la % di presenze
+
+
+def valuta_titolarita(partite):
+    if pd.isna(partite):
+        return {"cat": "ignoto", "icon": "⚪", "label": "Dato non disponibile (nuovo acquisto/debuttante)", "affidabilita": None}
+    if partite >= 25:
+        return {"cat": "titolare", "icon": "🟢", "label": "Titolare fisso", "affidabilita": 1.0}
+    if partite >= 15:
+        return {"cat": "rotazione", "icon": "🟡", "label": "Titolare / rotazione", "affidabilita": 0.85}
+    if partite >= 5:
+        return {"cat": "panchina", "icon": "🟠", "label": "Panchina, poco impiegato", "affidabilita": 0.55}
+    return {"cat": "marginale", "icon": "🔴", "label": "Quasi mai in campo", "affidabilita": 0.3}
 
 
 @st.cache_data
@@ -32,6 +45,16 @@ def load_players():
     df["fvm"] = pd.to_numeric(df["fvm"], errors="coerce")
     df = df[df["ruolo"].isin(RUOLI)].copy()
     df["label"] = df["nome"] + "  ·  " + df["squadra"] + "  (" + df["ruolo"] + ")"
+
+    # affidabilità della fantamedia in base a quanto ha giocato (poche partite = campione rumoroso)
+    df["affidabilita"] = df["partite"].apply(lambda p: valuta_titolarita(p)["affidabilita"])
+    df["qualita_score"] = df["fantamedia"] * df["affidabilita"].fillna(1.0)
+
+    # percentile di prezzo (quotazione) e di qualità dentro al proprio ruolo: la base del giudizio
+    # di convenienza (paga quanto vale? di più? di meno? rispetto ai pari ruolo)
+    df["quotazione_percentile_ruolo"] = df.groupby("ruolo")["quotazione"].rank(pct=True) * 100
+    df["qualita_percentile_ruolo"] = df.groupby("ruolo")["qualita_score"].rank(pct=True) * 100
+
     return df.sort_values("nome").reset_index(drop=True)
 
 
@@ -128,21 +151,6 @@ if st.session_state.storico:
 st.sidebar.button("🔄 Reset asta", on_click=reset_asta)
 
 
-PARTITE_STAGIONE = 38  # lunghezza campionato Serie A, per stimare la % di presenze
-
-
-def valuta_titolarita(partite):
-    if pd.isna(partite):
-        return {"cat": "ignoto", "icon": "⚪", "label": "Dato non disponibile (nuovo acquisto/debuttante)", "affidabilita": None}
-    if partite >= 25:
-        return {"cat": "titolare", "icon": "🟢", "label": "Titolare fisso", "affidabilita": 1.0}
-    if partite >= 15:
-        return {"cat": "rotazione", "icon": "🟡", "label": "Titolare / rotazione", "affidabilita": 0.85}
-    if partite >= 5:
-        return {"cat": "panchina", "icon": "🟠", "label": "Panchina, poco impiegato", "affidabilita": 0.55}
-    return {"cat": "marginale", "icon": "🔴", "label": "Quasi mai in campo", "affidabilita": 0.3}
-
-
 # ---------------- motore di raccomandazione ----------------
 def calcola_consiglio(player):
     ruolo = player["ruolo"]
@@ -164,6 +172,13 @@ def calcola_consiglio(player):
         fattore_fm = 1.0
     prezzo_atteso = prezzo_mercato * fattore_fm
     prezzo_suggerito = int(round(max(1, prezzo_atteso)))
+
+    # 3) convenienza reale: confronta il "rango" di prezzo e il "rango" di qualità del giocatore
+    # dentro al suo ruolo. Prezzo alto NON è di per sé un problema (i big costano); il problema è
+    # pagare un prezzo da fuoriclasse per un rendimento da comprimario, o viceversa.
+    prezzo_pct = player["quotazione_percentile_ruolo"]
+    qualita_pct = player["qualita_percentile_ruolo"]
+    divario = (qualita_pct - prezzo_pct) if pd.notna(qualita_pct) else None
 
     # vincolo reale dell'asta: dopo aver preso questo giocatore devi comunque poter chiudere
     # tutti gli altri slot liberi, e in un'asta random il minimo per ogni slot è 1 credito.
@@ -200,27 +215,57 @@ def calcola_consiglio(player):
             "Prendilo solo se hai un motivo concreto per pensare che avrà più spazio (titolare designato, rivale infortunato, nuovo allenatore) — "
             "altrimenti abbassa parecchio l'offerta o lascialo perdere."
         )
-    else:
-        esito = "PRENDILO"
+    elif divario is None:
+        esito = "DATI INSUFFICIENTI"
+        colore = "info"
+        dettaglio = (
+            f"Prezzo di mercato atteso ~{prezzo_suggerito} cr., ma non ho statistiche 2025/26 per lui (nuovo acquisto/debuttante): "
+            "non posso dirti se conviene. Valuta tu quanto spazio avrà nella nuova squadra prima di spingerti."
+        )
+    elif divario >= 25:
+        esito = "OTTIMO AFFARE"
         colore = "success"
         dettaglio = (
-            f"Prezzo di mercato atteso **~{prezzo_suggerito} crediti**. Te lo puoi permettere: "
-            f"dopo l'acquisto ti resterebbero comunque {round(margine_dopo_acquisto)} crediti di margine oltre al minimo per chiudere la rosa."
+            f"Rende molto più di quanto costa: è nel **{round(qualita_pct)}° percentile di qualità** ma solo nel "
+            f"**{round(prezzo_pct)}° di prezzo** tra i {RUOLO_NOME[ruolo].lower()}i. Vale la pena spingersi anche oltre "
+            f"i ~{prezzo_suggerito} cr. attesi, pur di portarlo a casa."
         )
-        if titolarita["cat"] == "ignoto":
-            dettaglio += " ℹ️ Nessuna statistica 2025/26 (nuovo acquisto/debuttante): non posso verificare la titolarità, informati sul suo ruolo nella nuova squadra."
-        elif titolarita["cat"] in ("panchina", "marginale"):
-            dettaglio += f" {titolarita['icon']} {titolarita['label']} ({int(player['partite'])} pres.): va bene come scommessa economica di fondo rosa, non aspettarti continuità."
+    elif divario >= 10:
+        esito = "BUON AFFARE"
+        colore = "success"
+        dettaglio = (
+            f"Buon rapporto qualità/prezzo (percentile qualità {round(qualita_pct)} vs percentile prezzo {round(prezzo_pct)} nel ruolo). "
+            f"Prendilo fino a ~{prezzo_suggerito} cr."
+        )
+    elif divario <= -25:
+        esito = "SOPRAVVALUTATO"
+        colore = "error"
+        dettaglio = (
+            f"Costa da fuoriclasse ma rende da comprimario: percentile prezzo {round(prezzo_pct)} contro solo "
+            f"{round(qualita_pct)} di qualità nel ruolo. A parità di crediti ci sono alternative decisamente migliori: lascialo perdere."
+        )
+    elif divario <= -10:
+        esito = "SOPRAPPREZZO"
+        colore = "warning"
+        dettaglio = (
+            f"Paghi più di quanto renda rispetto ai pari ruolo (percentile prezzo {round(prezzo_pct)} vs qualità {round(qualita_pct)}). "
+            f"Non oltre ~{prezzo_suggerito} cr., e solo se ti serve proprio quel profilo."
+        )
+    else:
+        esito = "PREZZO GIUSTO"
+        colore = "info"
+        dettaglio = (
+            f"Prezzo coerente col rendimento (percentile qualità {round(qualita_pct)} vs prezzo {round(prezzo_pct)}). "
+            f"Né affare né fregatura: prendilo a ~{prezzo_suggerito} cr. se ti serve quel ruolo, senza strapparlo a tutti i costi."
+        )
 
-    occasione = (
-        pd.notna(player["fantamedia"]) and fattore_fm >= 1.15 and prezzo_mercato <= budget_totale * 0.05
-        and titolarita["cat"] in ("titolare", "rotazione")
-    )
+    occasione = divario is not None and divario >= 35 and titolarita["cat"] in ("titolare", "rotazione")
 
     return {
         "esito": esito, "colore": colore, "dettaglio": dettaglio,
         "prezzo_mercato": round(prezzo_mercato), "prezzo_suggerito": prezzo_suggerito,
         "occasione": occasione, "titolarita": titolarita,
+        "prezzo_percentile": prezzo_pct, "qualita_percentile": qualita_pct,
     }
 
 
@@ -268,7 +313,7 @@ if nome_cercato:
 
         getattr(st, consiglio["colore"])(f"**{consiglio['esito']}** — {consiglio['dettaglio']}")
         if consiglio["occasione"]:
-            st.info("💎 Possibile occasione: rendimento nettamente sopra la media del ruolo per una quotazione bassa.")
+            st.info("💎 Occasione da non perdere: pochi giocatori nel ruolo hanno un rapporto qualità/prezzo così sbilanciato a tuo favore.")
 
     with c2:
         st.markdown("**Segna l'acquisto**")
