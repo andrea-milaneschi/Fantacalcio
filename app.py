@@ -1,3 +1,4 @@
+import math
 import os
 
 import pandas as pd
@@ -11,7 +12,13 @@ RUOLI = ["P", "D", "C", "A"]
 RUOLO_NOME = {"P": "Portiere", "D": "Difensore", "C": "Centrocampista", "A": "Attaccante"}
 DEFAULT_SLOT = {"P": 3, "D": 8, "C": 8, "A": 6}
 DEFAULT_PESO = {"P": 0.06, "D": 0.18, "C": 0.32, "A": 0.44}
-BUDGET_STANDARD_LISTONE = 500  # le quotazioni ufficiali sono calibrate su un'asta da 500 crediti
+
+# Curva di prezzo di mercato: prezzo_atteso = quotazione ^ gamma_ruolo, calibrata sui prezzi
+# reali osservati nella tua lega (Malen/L.Martinez=300, attaccanti forti 250-300, centro forti 100-150)
+# per un'asta da 1000 crediti. Portiere/Difensore non avevano un riferimento reale: sono una stima
+# prudente (curva simile, prezzo top più basso, coerente con come di solito vanno in asta) — tarabili qui sotto.
+BUDGET_RIFERIMENTO_CURVA = 1000
+PREZZO_TOP_DEFAULT = {"A": 300, "C": 150, "D": 130, "P": 70}
 
 
 @st.cache_data
@@ -31,6 +38,7 @@ def load_players():
 
 players = load_players()
 media_fantamedia_ruolo = players.groupby("ruolo")["fantamedia"].mean()
+quotazione_max_ruolo = players.groupby("ruolo")["quotazione"].max()
 
 # ---------------- session state ----------------
 # le chiavi dei widget (spesi_totali, presi_P/D/C/A) sono l'unica fonte di verità:
@@ -90,11 +98,34 @@ rosa_totale = sum(slot_tot.values())
 st.sidebar.metric("Crediti residui", crediti_residui)
 st.sidebar.metric("Slot liberi", f"{slot_liberi_totali} / {rosa_totale}")
 
+with st.sidebar.expander("🎯 Calibrazione prezzi di mercato"):
+    st.caption(
+        "Quanto costa il giocatore più forte di ciascun ruolo nella tua asta (1000 crediti). "
+        "Gli altri prezzi vengono scalati da questo con una curva realistica (i big costano molto più "
+        "che proporzionalmente, i gregari pochissimo). Attaccanti e centrocampisti sono tarati sui prezzi "
+        "reali che mi hai dato; portiere e difensore sono una stima prudente — correggili se sai qualcosa di più."
+    )
+    prezzo_top = {}
+    for r in RUOLI:
+        prezzo_top[r] = st.number_input(
+            f"Prezzo top {RUOLO_NOME[r].lower()} (quot. {quotazione_max_ruolo.get(r, 0):.0f})",
+            min_value=1, value=PREZZO_TOP_DEFAULT[r], step=5, key=f"prezzo_top_{r}",
+        )
+
 with st.sidebar.expander("⚙️ Impostazioni avanzate"):
-    st.caption("Quanto peso economico dare a ciascun ruolo nel calcolo (default = distribuzione standard di un'asta).")
+    st.caption("Quanto peso economico dare a ciascun ruolo nel calcolo di quanto puoi permetterti (solo per l'avviso di cautela/rischio).")
     peso = {}
     for r in RUOLI:
         peso[r] = st.slider(f"Peso {RUOLO_NOME[r]}", 0.0, 1.0, DEFAULT_PESO[r], 0.01, key=f"peso_{r}")
+
+# gamma per ruolo: prezzo(quotazione) = quotazione ^ gamma, tarato in modo che prezzo(quot_max) = prezzo_top
+gamma_ruolo = {}
+for r in RUOLI:
+    q_max = quotazione_max_ruolo.get(r, 1)
+    if q_max > 1:
+        gamma_ruolo[r] = math.log(prezzo_top[r]) / math.log(q_max)
+    else:
+        gamma_ruolo[r] = 1.0
 
 if st.session_state.storico:
     with st.sidebar.expander(f"🧾 Storico acquisti ({len(st.session_state.storico)})", expanded=False):
@@ -107,28 +138,34 @@ st.sidebar.button("🔄 Reset asta", on_click=reset_asta)
 # ---------------- motore di raccomandazione ----------------
 def calcola_consiglio(player):
     ruolo = player["ruolo"]
+    quotazione = max(1.0, player["quotazione"])
 
+    # 1) prezzo di mercato atteso: curva calibrata sui prezzi reali della tua lega
+    fattore_budget_utente = budget_totale / BUDGET_RIFERIMENTO_CURVA
+    prezzo_mercato = (quotazione ** gamma_ruolo[ruolo]) * fattore_budget_utente
+
+    # 2) aggiustamento leggero in base al rendimento reale rispetto alla media del ruolo
+    media_fm = media_fantamedia_ruolo.get(ruolo, float("nan"))
+    if pd.notna(player["fantamedia"]) and pd.notna(media_fm) and media_fm > 0:
+        scarto = (player["fantamedia"] - media_fm) / media_fm
+        fattore_fm = min(1.25, max(0.8, 1 + scarto * 0.6))
+    else:
+        fattore_fm = 1.0
+    prezzo_atteso = prezzo_mercato * fattore_fm
+
+    # 3) quanto puoi permetterti TU adesso, dato il ritmo di spesa rispetto agli slot ancora da riempire
+    frazione_soldi = crediti_residui / budget_totale if budget_totale > 0 else 0
+    frazione_slot = slot_liberi_totali / rosa_totale if rosa_totale > 0 else 1
+    ritmo = frazione_soldi / frazione_slot if frazione_slot > 0 else 1
+    fattore_ritmo = min(1.3, max(0.75, ritmo))
+
+    # quanto budget "ti spetterebbe" in media per uno slot di questo ruolo, dati gli slot liberi
     peso_pesato = {r: slot_liberi[r] * peso[r] for r in RUOLI}
     somma_pesi = sum(peso_pesato.values())
     quota_ruolo = crediti_residui * peso_pesato[ruolo] / somma_pesi if somma_pesi > 0 else 0
     budget_medio_slot_ruolo = quota_ruolo / slot_liberi[ruolo] if slot_liberi[ruolo] > 0 else 0
 
-    fattore_budget = budget_totale / BUDGET_STANDARD_LISTONE
-
-    media_fm = media_fantamedia_ruolo.get(ruolo, float("nan"))
-    if pd.notna(player["fantamedia"]) and pd.notna(media_fm) and media_fm > 0:
-        scarto = (player["fantamedia"] - media_fm) / media_fm
-        fattore_fm = min(1.5, max(0.7, 1 + scarto * 1.5))
-    else:
-        fattore_fm = 1.0
-
-    frazione_soldi = crediti_residui / budget_totale if budget_totale > 0 else 0
-    frazione_slot = slot_liberi_totali / rosa_totale if rosa_totale > 0 else 1
-    ritmo = frazione_soldi / frazione_slot if frazione_slot > 0 else 1
-    fattore_ritmo = min(1.6, max(0.6, ritmo))
-
-    prezzo_grezzo = player["quotazione"] * fattore_budget * fattore_fm * fattore_ritmo
-    prezzo_suggerito = int(round(max(1, min(prezzo_grezzo, max(crediti_residui, 0)))))
+    prezzo_suggerito = int(round(max(1, min(prezzo_atteso * fattore_ritmo, max(crediti_residui, 0)))))
 
     if slot_liberi[ruolo] == 0:
         esito = "RUOLO COMPLETO"
@@ -138,27 +175,31 @@ def calcola_consiglio(player):
         esito = "BUDGET ESAURITO"
         colore = "error"
         dettaglio = "Crediti residui insufficienti per offrire con margine."
+    elif prezzo_atteso > crediti_residui:
+        esito = "FUORI PORTATA"
+        colore = "error"
+        dettaglio = f"Il prezzo di mercato atteso (~{round(prezzo_atteso)} cr.) supera i tuoi crediti residui ({crediti_residui}). Non rincorrerlo."
     else:
-        rapporto = prezzo_suggerito / budget_medio_slot_ruolo if budget_medio_slot_ruolo > 0 else 1
-        if rapporto <= 1.15:
+        rapporto = prezzo_atteso / budget_medio_slot_ruolo if budget_medio_slot_ruolo > 0 else 1
+        if rapporto <= 1.2:
             esito = "PRENDILO"
             colore = "success"
-            dettaglio = f"Prezzo in linea con il budget che hai per un {RUOLO_NOME[ruolo].lower()}. Offri fino a **{prezzo_suggerito} crediti**."
-        elif rapporto <= 1.6:
+            dettaglio = f"Prezzo sostenibile per il budget che hai sul ruolo. Preparati a offrire fino a **{prezzo_suggerito} crediti**."
+        elif rapporto <= 1.8:
             esito = "VALUTA CON CAUTELA"
             colore = "warning"
-            dettaglio = f"Costerebbe più della media per il ruolo. Spingiti al massimo fino a **{prezzo_suggerito} crediti**, solo se lo vuoi davvero."
+            dettaglio = f"Costerà più della media che ti puoi permettere per il ruolo. Spingiti al massimo fino a **{prezzo_suggerito} crediti**, solo se lo vuoi davvero e sei disposto a tagliare altrove."
         else:
             esito = "EVITA / RISCHIO SBILANCIARE"
             colore = "error"
-            dettaglio = f"Prezzo probabile troppo alto rispetto al budget rimasto per il ruolo ({round(budget_medio_slot_ruolo)} cr. medi/slot). Rischi di non chiudere la rosa."
+            dettaglio = f"Prezzo atteso troppo alto rispetto al budget rimasto per il ruolo ({round(budget_medio_slot_ruolo)} cr. medi/slot). Rischi di non chiudere la rosa."
 
-    occasione = pd.notna(player["fantamedia"]) and fattore_fm >= 1.25 and player["quotazione"] <= 20
+    occasione = pd.notna(player["fantamedia"]) and fattore_fm >= 1.15 and prezzo_mercato <= budget_totale * 0.05
 
     return {
         "esito": esito, "colore": colore, "dettaglio": dettaglio,
-        "prezzo_suggerito": prezzo_suggerito, "budget_medio_slot_ruolo": round(budget_medio_slot_ruolo),
-        "occasione": occasione,
+        "prezzo_mercato": round(prezzo_mercato), "prezzo_suggerito": prezzo_suggerito,
+        "budget_medio_slot_ruolo": round(budget_medio_slot_ruolo), "occasione": occasione,
     }
 
 
@@ -185,12 +226,14 @@ if nome_cercato:
     with c1:
         st.subheader(f"{player['nome']} — {player['squadra']} ({RUOLO_NOME[player['ruolo']]})")
 
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Quotazione uff.", f"{player['quotazione']:.0f}")
-        m2.metric("FVM", f"{player['fvm']:.0f}" if pd.notna(player["fvm"]) else "n/d")
+        m2.metric("💰 Prezzo mercato atteso", f"~{consiglio['prezzo_mercato']} cr.")
         m3.metric("Fantamedia '25/26", f"{player['fantamedia']:.2f}" if pd.notna(player["fantamedia"]) else "n/d")
         m4.metric("Gol", f"{player['gol']:.0f}" if pd.notna(player["gol"]) else "n/d")
         m5.metric("Assist", f"{player['assist']:.0f}" if pd.notna(player["assist"]) else "n/d")
+        m6.metric("FVM", f"{player['fvm']:.0f}" if pd.notna(player["fvm"]) else "n/d")
+        st.caption("Il **prezzo di mercato atteso** è quanto probabilmente costerà questo giocatore in un'asta da 1000 crediti come la tua, in base alla curva calibrata sui prezzi reali. Il consiglio sotto lo confronta con quanto TU puoi permetterti ora.")
 
         if pd.isna(player["fantamedia"]):
             st.caption("⚠️ Nessuna statistica trovata per la scorsa stagione (probabile nuovo acquisto, debuttante o dato non disponibile). Il consiglio si basa solo sulla quotazione ufficiale.")
