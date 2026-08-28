@@ -286,56 +286,57 @@ nome_cercato = st.selectbox(
 if nome_cercato:
     player = players[players["label"] == nome_cercato].iloc[0]
     consiglio = calcola_consiglio(player)
+    tit = consiglio["titolarita"]
+    presenze_str = f"{int(player['partite'])}/{PARTITE_STAGIONE} presenze 2025/26" if pd.notna(player["partite"]) else "nessun dato presenze"
 
-    c1, c2 = st.columns([2, 1])
+    # Ordine pensato per il telefono durante l'asta: nome -> titolarità -> verdetto -> prezzo/acquisto
+    # subito visibili senza scroll; i dettagli statistici sono un tap più in là, non il primo sguardo.
+    st.subheader(f"{player['nome']} — {player['squadra']} ({RUOLO_NOME[player['ruolo']]})")
+    st.markdown(f"{tit['icon']} **{tit['label']}** · {presenze_str}")
 
-    with c1:
-        tit = consiglio["titolarita"]
-        presenze_str = f"{int(player['partite'])}/{PARTITE_STAGIONE} presenze 2025/26" if pd.notna(player["partite"]) else "nessun dato presenze"
-        st.subheader(f"{player['nome']} — {player['squadra']} ({RUOLO_NOME[player['ruolo']]})")
-        st.markdown(f"{tit['icon']} **{tit['label']}** · {presenze_str}")
+    if pd.isna(player["fantamedia"]):
+        st.caption("⚠️ Nessuna statistica trovata per la scorsa stagione (probabile nuovo acquisto, debuttante o dato non disponibile). Il consiglio si basa solo sulla quotazione ufficiale.")
 
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Quotazione uff.", f"{player['quotazione']:.0f}")
-        m2.metric("💰 Prezzo mercato atteso", f"~{consiglio['prezzo_mercato']} cr.")
-        m3.metric("Fantamedia '25/26", f"{player['fantamedia']:.2f}" if pd.notna(player["fantamedia"]) else "n/d")
-        m4.metric("Gol", f"{player['gol']:.0f}" if pd.notna(player["gol"]) else "n/d")
-        m5.metric("Assist", f"{player['assist']:.0f}" if pd.notna(player["assist"]) else "n/d")
-        m6.metric("FVM", f"{player['fvm']:.0f}" if pd.notna(player["fvm"]) else "n/d")
-        st.caption(
-            "Il **prezzo di mercato atteso** è quanto probabilmente costerà questo giocatore in un'asta da 1000 "
-            "crediti come la tua, in base alla curva calibrata sui prezzi reali e smorzata dalla titolarità. "
-            "Il consiglio sotto lo confronta con quanto TU puoi permetterti ora — e con quanto rischia di stare in panchina."
-        )
+    getattr(st, consiglio["colore"])(f"**{consiglio['esito']}** — {consiglio['dettaglio']}")
+    if consiglio["occasione"]:
+        st.info("💎 Occasione da non perdere: pochi giocatori nel ruolo hanno un rapporto qualità/prezzo così sbilanciato a tuo favore.")
 
-        if pd.isna(player["fantamedia"]):
-            st.caption("⚠️ Nessuna statistica trovata per la scorsa stagione (probabile nuovo acquisto, debuttante o dato non disponibile). Il consiglio si basa solo sulla quotazione ufficiale.")
-
-        getattr(st, consiglio["colore"])(f"**{consiglio['esito']}** — {consiglio['dettaglio']}")
-        if consiglio["occasione"]:
-            st.info("💎 Occasione da non perdere: pochi giocatori nel ruolo hanno un rapporto qualità/prezzo così sbilanciato a tuo favore.")
-
-    with c2:
-        st.markdown("**Segna l'acquisto**")
+    b1, b2 = st.columns(2)
+    b1.metric("💰 Prezzo mercato atteso", f"~{consiglio['prezzo_mercato']} cr.")
+    with b2:
         prezzo_pagato = st.number_input(
             "Prezzo pagato (crediti)", min_value=0, value=consiglio["prezzo_suggerito"], step=1, key="prezzo_input"
         )
-        if slot_liberi[player["ruolo"]] == 0:
-            st.button("Segna come preso", disabled=True, help="Ruolo già completo")
-        else:
-            st.button(
-                "✅ Segna come preso (mio)",
-                on_click=segna_acquistato,
-                args=(player["nome"], player["ruolo"], player["squadra"], prezzo_pagato),
-            )
-
-    if pd.notna(player["fantamedia"]):
-        media_ruolo = media_fantamedia_ruolo.get(player["ruolo"])
-        confronto = pd.DataFrame(
-            {"Fantamedia": [player["fantamedia"], media_ruolo]},
-            index=[player["nome"], f"Media {RUOLO_NOME[player['ruolo']]}i"],
+    if slot_liberi[player["ruolo"]] == 0:
+        st.button("Segna come preso", disabled=True, help="Ruolo già completo", width="stretch")
+    else:
+        st.button(
+            "✅ Segna come preso (mio)",
+            on_click=segna_acquistato,
+            args=(player["nome"], player["ruolo"], player["squadra"], prezzo_pagato),
+            width="stretch",
         )
-        st.bar_chart(confronto)
+
+    with st.expander("📊 Statistiche dettagliate"):
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Quotazione uff.", f"{player['quotazione']:.0f}")
+        m2.metric("Fantamedia '25/26", f"{player['fantamedia']:.2f}" if pd.notna(player["fantamedia"]) else "n/d")
+        m3.metric("Gol", f"{player['gol']:.0f}" if pd.notna(player["gol"]) else "n/d")
+        m4.metric("Assist", f"{player['assist']:.0f}" if pd.notna(player["assist"]) else "n/d")
+        m5.metric("FVM", f"{player['fvm']:.0f}" if pd.notna(player["fvm"]) else "n/d")
+        st.caption(
+            "Il **prezzo di mercato atteso** è quanto probabilmente costerà questo giocatore in un'asta da 1000 "
+            "crediti come la tua, in base alla curva calibrata sui prezzi reali e smorzata dalla titolarità. "
+            "Il consiglio sopra lo confronta con quanto TU puoi permetterti ora, con la sua convenienza rispetto "
+            "ai pari ruolo, e con quanto rischia di stare in panchina."
+        )
+        if pd.notna(player["fantamedia"]):
+            media_ruolo = media_fantamedia_ruolo.get(player["ruolo"])
+            confronto = pd.DataFrame(
+                {"Fantamedia": [player["fantamedia"], media_ruolo]},
+                index=[player["nome"], f"Media {RUOLO_NOME[player['ruolo']]}i"],
+            )
+            st.bar_chart(confronto)
 
 st.divider()
 
